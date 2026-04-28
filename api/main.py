@@ -4,8 +4,13 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from core.models import ScanTarget
-from repositories.in_memory_scan_repository import InMemoryScanRepository
+from repositories.cosmos_scan_repository import CosmosScanRepository
+from repositories.blob_report_repository import BlobReportRepository
+
 from services.scan_service import ScanService
+
+from dotenv import load_dotenv
+load_dotenv()
 
 
 app = FastAPI(
@@ -14,8 +19,12 @@ app = FastAPI(
     description="Backend para correr scans assíncronos com OpenAPI ou brute-force básico"
 )
 
-repository = InMemoryScanRepository()
-scan_service = ScanService(repository=repository)
+repository = CosmosScanRepository()
+blob_repository = BlobReportRepository()
+scan_service = ScanService(
+    repository=repository,
+    blob_repository=blob_repository
+)
 
 
 class ScanRequest(BaseModel):

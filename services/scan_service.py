@@ -7,11 +7,16 @@ from typing import List, Optional
 
 from core.engine import APIScanEngine
 from core.models import ScanConfig, ScanTarget
-from repositories.in_memory_scan_repository import InMemoryScanRepository
+from repositories.cosmos_scan_repository import CosmosScanRepository
+from repositories.blob_report_repository import BlobReportRepository
 
 
 class ScanService:
-    def __init__(self, repository: Optional[InMemoryScanRepository] = None):
+    def __init__(
+        self,
+        repository: Optional[CosmosScanRepository] = None,
+        blob_repository: Optional[BlobReportRepository] = None
+    ):
         self.engine = APIScanEngine(
             ScanConfig(
                 timeout=2,
@@ -20,8 +25,16 @@ class ScanService:
                 enable_bruteforce=True
             )
         )
-        self.repository = repository or InMemoryScanRepository()
 
+        # Cosmos (obrigatório)
+        self.repository = repository or CosmosScanRepository()
+
+        # Blob (opcional)
+        self.blob_repository = blob_repository
+
+    # --------------------------------------------------------------
+    # Download OpenAPI spec
+    # --------------------------------------------------------------
     def _download_spec(self, spec_url: str) -> str:
         response = requests.get(spec_url, timeout=10)
         response.raise_for_status()
@@ -41,6 +54,9 @@ class ScanService:
 
         return temp_file.name
 
+    # --------------------------------------------------------------
+    # Criar scan (só metadata leve)
+    # --------------------------------------------------------------
     def create_scan_job(self, target: ScanTarget) -> dict:
         scan_id = str(uuid.uuid4())
 
@@ -48,25 +64,28 @@ class ScanService:
             "scan_id": scan_id,
             "target_url": target.base_url,
             "status": "pending",
-            "findings": [],
             "final_score": 0.0,
             "grade": "Pending",
-            "category_scores": {},
             "started_at": None,
             "finished_at": None,
             "duration_ms": 0,
             "spec_url": target.spec_url,
             "error_message": None,
-            "discovered_endpoints_count": 0
+            "discovered_endpoints_count": 0,
+            "report_url": None
         }
 
         self.repository.save(scan_job)
         return scan_job
 
+    # --------------------------------------------------------------
+    # Executar scan
+    # --------------------------------------------------------------
     def execute_scan_job(self, scan_id: str, target: ScanTarget) -> None:
         temp_spec_path = None
         started_dt = datetime.now(timezone.utc)
 
+        # Estado: running
         self.repository.update(
             scan_id,
             {
@@ -77,53 +96,89 @@ class ScanService:
         )
 
         try:
+            # Download spec se existir
             if target.spec_url:
                 temp_spec_path = self._download_spec(target.spec_url)
                 target.spec_path = temp_spec_path
 
             result = self.engine.run(target)
 
-            self.repository.update(
-                scan_id,
-                {
-                    "status": "completed",
-                    "findings": [f.to_dict() for f in result.findings],
-                    "final_score": result.final_score,
-                    "grade": result.grade,
-                    "category_scores": result.category_scores,
-                    "started_at": result.started_at,
-                    "finished_at": result.finished_at,
-                    "duration_ms": result.duration_ms,
-                    "spec_url": result.spec_url,
-                    "error_message": None,
-                    "discovered_endpoints_count": result.discovered_endpoints_count
-                }
-            )
+            # -------------------------------
+            # 📦 RELATÓRIO COMPLETO (Blob)
+            # -------------------------------
+            full_report = {
+                "scan_id": scan_id,
+                "target_url": target.base_url,
+                "findings": [f.to_dict() for f in result.findings],
+                "category_scores": result.category_scores,
+                "final_score": result.final_score,
+                "grade": result.grade,
+                "started_at": result.started_at,
+                "finished_at": result.finished_at,
+                "duration_ms": result.duration_ms,
+                "exported_at": datetime.now(timezone.utc).isoformat()
+            }
+
+            report_url = None
+
+            if self.blob_repository:
+                report_url = self.blob_repository.save_report(scan_id, full_report)
+
+            # -------------------------------
+            # 🗄️ METADATA (Cosmos)
+            # -------------------------------
+            completed_data = {
+                "status": "completed",
+                "final_score": result.final_score,
+                "grade": result.grade,
+                "started_at": result.started_at,
+                "finished_at": result.finished_at,
+                "duration_ms": result.duration_ms,
+                "error_message": None,
+                "discovered_endpoints_count": result.discovered_endpoints_count,
+                "report_url": report_url
+            }
+
+            self.repository.update(scan_id, completed_data)
 
         except Exception as e:
             finished_dt = datetime.now(timezone.utc)
             duration_ms = int((finished_dt - started_dt).total_seconds() * 1000)
 
-            self.repository.update(
+            failed_data = {
+                "status": "failed",
+                "finished_at": finished_dt.isoformat(),
+                "duration_ms": duration_ms,
+                "error_message": str(e)
+            }
+
+            self.repository.update(scan_id, failed_data)
+ 
+            # Guarda log de falha no Blob sempre, sem depender do update
+            self.blob_repository.save_log(
                 scan_id,
-                {
-                    "status": "failed",
-                    "finished_at": finished_dt.isoformat(),
-                    "duration_ms": duration_ms,
-                    "error_message": str(e)
-                }
+                f"Scan {scan_id} falhou em {finished_dt.isoformat()}\nErro: {e}"
             )
 
         finally:
             if temp_spec_path and os.path.exists(temp_spec_path):
                 os.remove(temp_spec_path)
 
+    # --------------------------------------------------------------
+    # Listar scans
+    # --------------------------------------------------------------
     def list_scans(self) -> List[dict]:
         return self.repository.list_all()
 
+    # --------------------------------------------------------------
+    # Obter scan
+    # --------------------------------------------------------------
     def get_scan_by_id(self, scan_id: str) -> Optional[dict]:
         return self.repository.get_by_id(scan_id)
 
+    # --------------------------------------------------------------
+    # Status simplificado
+    # --------------------------------------------------------------
     def get_scan_status(self, scan_id: str) -> Optional[dict]:
         scan = self.repository.get_by_id(scan_id)
         if not scan:
